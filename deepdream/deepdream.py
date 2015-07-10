@@ -1,3 +1,5 @@
+#!/usr/bin/python
+
 # imports and basic notebook setup
 from cStringIO import StringIO
 import numpy as np
@@ -6,8 +8,8 @@ import PIL.Image
 import json
 from IPython.display import clear_output, Image, display
 from google.protobuf import text_format
-
 import caffe
+import argparse, os
 
 def showarray(a, fmt='jpeg'):
     a = np.uint8(np.clip(a, 0, 255))
@@ -15,25 +17,27 @@ def showarray(a, fmt='jpeg'):
     PIL.Image.fromarray(a).save(f, fmt)
     display(Image(data=f.getvalue()))
 
-with open("settings.json") as json_file:
-    json_data = json.load(json_file)
-    #print()
-
 
 model_path = '../caffe/models/bvlc_googlenet/' # substitute your path here
 net_fn   = model_path + 'deploy.prototxt'
 param_fn = model_path + 'bvlc_googlenet.caffemodel'
 
-# Patching model to be able to compute gradients.
-# Note that you can also manually add "force_backward: true" line to "deploy.prototxt".
-model = caffe.io.caffe_pb2.NetParameter()
-text_format.Merge(open(net_fn).read(), model)
-model.force_backward = True
-open('tmp.prototxt', 'w').write(str(model))
+model = None
+net = None
 
-net = caffe.Classifier('tmp.prototxt', param_fn,
-                       mean = np.float32([104.0, 116.0, 122.0]), # ImageNet mean, training set dependent
-                       channel_swap = (2,1,0)) # the reference model has channels in BGR order instead of RGB
+def deepdream_init():
+  global model
+  global net
+  # Patching model to be able to compute gradients.
+  # Note that you can also manually add "force_backward: true" line to "deploy.prototxt".
+  model = caffe.io.caffe_pb2.NetParameter()
+  text_format.Merge(open(net_fn).read(), model)
+  model.force_backward = True
+  open('tmp.prototxt', 'w').write(str(model))
+
+  net = caffe.Classifier('tmp.prototxt', param_fn,
+                         mean = np.float32([104.0, 116.0, 122.0]), # ImageNet mean, training set dependent
+                         channel_swap = (2,1,0)) # the reference model has channels in BGR order instead of RGB
 
 # a couple of utility functions for converting to and from Caffe's input image layout
 def preprocess(net, img):
@@ -49,7 +53,7 @@ def make_step(net, step_size=1.5, end='inception_4c/output', jitter=32, clip=Tru
 
     ox, oy = np.random.randint(-jitter, jitter+1, 2)
     src.data[0] = np.roll(np.roll(src.data[0], ox, -1), oy, -2) # apply jitter shift
-            
+
     net.forward(end=end)
     dst.diff[:] = dst.data  # specify the optimiation objective
     net.backward(start=end)
@@ -58,17 +62,17 @@ def make_step(net, step_size=1.5, end='inception_4c/output', jitter=32, clip=Tru
     src.data[:] += step_size/np.abs(g).mean() * g
 
     src.data[0] = np.roll(np.roll(src.data[0], -ox, -1), -oy, -2) # unshift image
-            
+
     if clip:
         bias = net.transformer.mean['data']
-        src.data[:] = np.clip(src.data, -bias, 255-bias)    
+        src.data[:] = np.clip(src.data, -bias, 255-bias)
 
 def deepdream(net, base_img, iter_n=10, octave_n=4, octave_scale=1.4, end='inception_4c/output', clip=True, **step_params):
     # prepare base images for all octaves
     octaves = [preprocess(net, base_img)]
     for i in xrange(octave_n-1):
         octaves.append(nd.zoom(octaves[-1], (1, 1.0/octave_scale,1.0/octave_scale), order=1))
-    
+
     src = net.blobs['data']
     detail = np.zeros_like(octaves[-1]) # allocate image for network-produced details
     for octave, octave_base in enumerate(octaves[::-1]):
@@ -82,7 +86,7 @@ def deepdream(net, base_img, iter_n=10, octave_n=4, octave_scale=1.4, end='incep
         src.data[0] = octave_base+detail
         for i in xrange(iter_n):
             make_step(net, end=end, clip=clip, **step_params)
-            
+
             # visualization
             vis = deprocess(net, src.data[0])
             if not clip: # adjust image contrast if clipping is disabled
@@ -90,37 +94,48 @@ def deepdream(net, base_img, iter_n=10, octave_n=4, octave_scale=1.4, end='incep
             #showarray(vis)
             print octave, i, end, vis.shape
             clear_output(wait=True)
-            
         # extract details produced on the current octave
         detail = src.data[0]-octave_base
     # returning the resulting image
     return deprocess(net, src.data[0])
 
+# Read in the settings
+with open("/opt/deepdream/settings.json") as json_file:
+  json_data = json.load(json_file)
+if not json_data:
+  json_data = {}
 
-maxwidth = json_data['maxwidth']
-img = PIL.Image.open('input.jpg')
-width = img.size[0]
+def process_image(input_img, output_img):
+  """Process the image that is passed in"""
+  if not os.path.exists(input_img):
+    print "No such image {}".format(input_img)
+    return
+  maxwidth = json_data.get('maxwidth', 400)
+  img = PIL.Image.open(input_img)
+  width = img.size[0]
+  if width > maxwidth:
+      wpercent = (maxwidth/float(img.size[0]))
+      hsize = int((float(img.size[1])*float(wpercent)))
+      img = img.resize((maxwidth,hsize), PIL.Image.ANTIALIAS)
 
-if width > maxwidth:
-    wpercent = (maxwidth/float(img.size[0]))
-    hsize = int((float(img.size[1])*float(wpercent)))
-    img = img.resize((maxwidth,hsize), PIL.Image.ANTIALIAS)
+  img = np.float32(img)
+  frame = img
+  frame = deepdream(net, frame, end=json_data['layer'])
+  PIL.Image.fromarray(np.uint8(frame)).save(output_img)
 
-img = np.float32(img)
-
-frame = img
-#frame_i = 0
-
-frame = deepdream(net, frame, end=json_data['layer'])
-#frame = deepdream(net, img, end='inception_3b/5x5_reduce')
-#frame = deepdream(net, img, end='conv2/3x3')
-
-PIL.Image.fromarray(np.uint8(frame)).save("output.jpg")
-
-#h, w = frame.shape[:2]
-#s = 0.05 # scale coefficient
-#for i in xrange(100):
-#    frame = deepdream(net, frame)
-#    PIL.Image.fromarray(np.uint8(frame)).save("output/%04d.jpg"%frame_i)
-#    frame = nd.affine_transform(frame, [1-s,1-s,1], [h*s/2,w*s/2,0], order=1)
-#    frame_i += 1
+if __name__=="__main__":
+  parser = argparse.ArgumentParser(description = "Google's deepdream")
+  parser.add_argument('input_img', help='The input image')
+  parser.add_argument('output_img', help='The output image')
+  parser.add_argument('-l', '--layer', help='What layer to use')
+  parser.add_argument('-v', '--verbose', action='store_true',
+                      help='Whether to show verbose logging')
+  args = parser.parse_args()
+  if args.verbose:
+    global VERBOSE
+    VERBOSE=True
+  if args.layer:
+    global json_data
+    json_data['layer'] = args.layer
+  deepdream_init()
+  process_image(args.input_img, args.output_img)
